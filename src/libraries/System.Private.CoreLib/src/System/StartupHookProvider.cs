@@ -4,8 +4,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Diagnostics.Tracing;
 using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.Tracing;
 using System.IO;
 using System.Reflection;
 using System.Runtime.Loader;
@@ -85,13 +85,13 @@ namespace System
 
         private static void ParseStartupHook(ref StartupHookNameOrPath startupHook, string startupHookPart)
         {
-            ReadOnlySpan<char> disallowedSimpleAssemblyNameChars = stackalloc char[4]
-            {
+            ReadOnlySpan<char> disallowedSimpleAssemblyNameChars =
+            [
                 Path.DirectorySeparatorChar,
                 Path.AltDirectorySeparatorChar,
                 ' ',
                 ','
-            };
+            ];
 
             if (string.IsNullOrEmpty(startupHookPart))
             {
@@ -209,7 +209,7 @@ namespace System
             Debug.Assert(initializeMethod != null &&
                          initializeMethod.IsStatic &&
                          initializeMethod.ReturnType == typeof(void) &&
-                         initializeMethod.GetParameters().Length == 0);
+                         initializeMethod.GetParametersAsSpan().Length == 0);
 
             initializeMethod.Invoke(null, null);
         }

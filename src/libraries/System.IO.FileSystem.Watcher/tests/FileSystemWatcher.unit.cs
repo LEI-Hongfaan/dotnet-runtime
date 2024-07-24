@@ -232,7 +232,7 @@ namespace System.IO.Tests
             watcher.Filter = "abc.dll";
             Assert.Equal("abc.dll", watcher.Filter);
 
-            if (!PlatformDetection.IsOSXLike)
+            if (!PlatformDetection.IsApplePlatform)
             {
                 watcher.Filter = "ABC.DLL";
                 Assert.Equal("ABC.DLL", watcher.Filter);
@@ -258,6 +258,7 @@ namespace System.IO.Tests
         }
 
         [Fact]
+        [ActiveIssue("https://github.com/dotnet/runtime/issues/103584", TestPlatforms.Windows)]
         public void FileSystemWatcher_InternalBufferSize()
         {
             FileSystemWatcher watcher = new FileSystemWatcher();
@@ -371,7 +372,7 @@ namespace System.IO.Tests
 
                 fsw.Created += (o, e) =>
                 {
-                    Assert.True(fullPath.Equals(e.FullPath, StringComparison.OrdinalIgnoreCase));
+                    Assert.Equal(fullPath, e.FullPath, StringComparer.OrdinalIgnoreCase);
                     are.Set();
                 };
 
@@ -567,6 +568,7 @@ namespace System.IO.Tests
         }
 
         [Fact]
+        [ActiveIssue("https://github.com/dotnet/runtime/issues/103584", TestPlatforms.Windows)]
         public void FileSystemWatcher_WatchingAliasedFolderResolvesToRealPathWhenWatching()
         {
             string dir = CreateTestDirectory(TestDirectory, "dir");
@@ -1001,6 +1003,7 @@ namespace System.IO.Tests
         }
 
         [Fact]
+        [ActiveIssue("https://github.com/dotnet/runtime/issues/103584", TestPlatforms.Windows)]
         public void FileSystemWatcher_Directory_Delete_MultipleFilters()
         {
             using var tempDir = new TempDirectory();

@@ -56,11 +56,30 @@ lookup_intrins (guint16 *intrinsics, int size, MonoMethod *cmethod)
 // i.e. all 'get_' and 'op_' need to come after regular title-case names
 static guint16 sri_vector128_methods [] = {
 	SN_AndNot,
+	SN_As,
+	SN_AsByte,
+	SN_AsDouble,
+	SN_AsInt16,
+	SN_AsInt32,
+	SN_AsInt64,
+	SN_AsNInt,
+	SN_AsNUInt,
+	SN_AsPlane,
+	SN_AsQuaternion,
+	SN_AsSByte,
+	SN_AsSingle,
+	SN_AsUInt16,
+	SN_AsUInt32,
+	SN_AsUInt64,
+	SN_AsVector,
+	SN_AsVector4,
+	SN_AsVector128,
 	SN_ConditionalSelect,
 	SN_Create,
 	SN_CreateScalar,
 	SN_CreateScalarUnsafe,
 	SN_Equals,
+	SN_EqualsAny,
 	SN_ExtractMostSignificantBits,
 	SN_GreaterThan,
 	SN_LessThan,
@@ -309,12 +328,48 @@ get_common_simd_info (MonoClass *vector_klass, MonoMethodSignature *csignature, 
 	return TRUE;
 }
 
+static MonoType*
+get_vector_t_elem_type (MonoType *vector_type)
+{
+	MonoClass *klass;
+	MonoType *etype;
+
+	g_assert (vector_type->type == MONO_TYPE_GENERICINST);
+	klass = mono_class_from_mono_type_internal (vector_type);
+	g_assert (
+		!strcmp (m_class_get_name (klass), "Vector`1") ||
+		!strcmp (m_class_get_name (klass), "Vector64`1") ||
+		!strcmp (m_class_get_name (klass), "Vector128`1") ||
+		!strcmp (m_class_get_name (klass), "Vector256`1") ||
+		!strcmp (m_class_get_name (klass), "Vector512`1"));
+	etype = mono_class_get_context (klass)->class_inst->type_argv [0];
+	return etype;
+}
+
+static gboolean
+is_element_type_primitive (MonoType *vector_type)
+{
+	if (vector_type->type == MONO_TYPE_GENERICINST) {
+		MonoType *element_type = get_vector_t_elem_type (vector_type);
+		return MONO_TYPE_IS_VECTOR_PRIMITIVE (element_type);
+	} else {
+		MonoClass *klass = mono_class_from_mono_type_internal (vector_type);
+		g_assert (
+			!strcmp (m_class_get_name (klass), "Plane") ||
+			!strcmp (m_class_get_name (klass), "Quaternion") ||
+			!strcmp (m_class_get_name (klass), "Vector2") ||
+			!strcmp (m_class_get_name (klass), "Vector3") ||
+			!strcmp (m_class_get_name (klass), "Vector4"));
+		return TRUE;
+	}
+}
+
 static void
 emit_common_simd_epilogue (TransformData *td, MonoClass *vector_klass, MonoMethodSignature *csignature, int vector_size, gboolean allow_void)
 {
 	td->sp -= csignature->param_count;
 	for (int i = 0; i < csignature->param_count; i++)
-		td->last_ins->sregs [i] = td->sp [i].local;
+		td->last_ins->sregs [i] = td->sp [i].var;
 
 	int ret_mt = mono_mint_type (csignature->ret);
 	if (csignature->ret->type == MONO_TYPE_VOID) {
@@ -323,10 +378,10 @@ emit_common_simd_epilogue (TransformData *td, MonoClass *vector_klass, MonoMetho
 	} else if (ret_mt == MINT_TYPE_VT) {
 		// For these intrinsics, if we return a VT then it is a V128
 		push_type_vt (td, vector_klass, vector_size);
-		interp_ins_set_dreg (td->last_ins, td->sp [-1].local);
+		interp_ins_set_dreg (td->last_ins, td->sp [-1].var);
 	} else {
 		push_simple_type (td, stack_type [ret_mt]);
-		interp_ins_set_dreg (td->last_ins, td->sp [-1].local);
+		interp_ins_set_dreg (td->last_ins, td->sp [-1].var);
 	}
 	td->ip += 5;
 }
@@ -346,14 +401,14 @@ emit_vector_create (TransformData *td, MonoMethodSignature *csignature, MonoClas
 	int *call_args = (int*)mono_mempool_alloc (td->mempool, (num_args + 1) * sizeof (int));
 	td->sp -= csignature->param_count;
 	for (int i = 0; i < num_args; i++)
-		call_args [i] = td->sp [i].local;
+		call_args [i] = td->sp [i].var;
 	call_args [num_args] = -1;
 	init_last_ins_call (td);
 	td->last_ins->info.call_info->call_args = call_args;
 	if (!td->optimized)
 		td->last_ins->info.call_info->call_offset = get_tos_offset (td);
 	push_type_vt (td, vector_klass, vector_size);
-	interp_ins_set_dreg (td->last_ins, td->sp [-1].local);
+	interp_ins_set_dreg (td->last_ins, td->sp [-1].var);
 }
 
 static gboolean
@@ -374,7 +429,13 @@ emit_sri_vector128 (TransformData *td, MonoMethod *cmethod, MonoMethodSignature 
 	gint16 simd_opcode = -1;
 	gint16 simd_intrins = -1;
 
-	vector_klass = mono_class_from_mono_type_internal (csignature->ret);
+	if (csignature->ret->type == MONO_TYPE_GENERICINST) {
+		vector_klass = mono_class_from_mono_type_internal (csignature->ret);
+	} else if (csignature->params [0]->type == MONO_TYPE_GENERICINST) {
+		vector_klass = mono_class_from_mono_type_internal (csignature->params [0]);
+	} else {
+		return FALSE;
+	}
 
 	MonoTypeEnum atype;
 	int arg_size, scalar_arg;
@@ -386,6 +447,48 @@ emit_sri_vector128 (TransformData *td, MonoMethod *cmethod, MonoMethodSignature 
 			simd_opcode = MINT_SIMD_INTRINS_P_PP;
 			simd_intrins = INTERP_SIMD_INTRINSIC_V128_AND_NOT;
 			break;
+		case SN_As:
+		case SN_AsByte:
+		case SN_AsDouble:
+		case SN_AsInt16:
+		case SN_AsInt32:
+		case SN_AsInt64:
+		case SN_AsNInt:
+		case SN_AsNUInt:
+		case SN_AsPlane:
+		case SN_AsQuaternion:
+		case SN_AsSByte:
+		case SN_AsSingle:
+		case SN_AsUInt16:
+		case SN_AsUInt32:
+		case SN_AsUInt64:
+		case SN_AsVector:
+		case SN_AsVector128:
+		case SN_AsVector4: {
+			if (!is_element_type_primitive (csignature->ret) || !is_element_type_primitive (csignature->params [0]))
+				return FALSE;
+
+			MonoClass *ret_class = mono_class_from_mono_type_internal (csignature->ret);
+			int ret_size = mono_class_value_size (ret_class, NULL);
+
+			MonoClass *arg_class = mono_class_from_mono_type_internal (csignature->params [0]);
+			int arg_size = mono_class_value_size (arg_class, NULL);
+
+			vector_klass = ret_class;
+			vector_size = ret_size;
+
+			if (arg_size == ret_size) {
+				td->sp--;
+				interp_add_ins (td, MINT_MOV_VT);
+				interp_ins_set_sreg (td->last_ins, td->sp [0].var);
+				push_type_vt (td, vector_klass, vector_size);
+				interp_ins_set_dreg (td->last_ins, td->sp [-1].var);
+				td->last_ins->data [0] = GINT32_TO_UINT16 (vector_size);
+				td->ip += 5;
+				return TRUE;
+			}
+			return FALSE;
+		}
 		case SN_ConditionalSelect:
 			simd_opcode = MINT_SIMD_INTRINS_P_PPP;
 			simd_intrins = INTERP_SIMD_INTRINSIC_V128_CONDITIONAL_SELECT;
@@ -418,6 +521,13 @@ emit_sri_vector128 (TransformData *td, MonoMethod *cmethod, MonoMethodSignature 
 			else if (atype == MONO_TYPE_I4 || atype == MONO_TYPE_U4) simd_intrins = INTERP_SIMD_INTRINSIC_V128_I4_EQUALS;
 			else if (atype == MONO_TYPE_I8 || atype == MONO_TYPE_U8) simd_intrins = INTERP_SIMD_INTRINSIC_V128_I8_EQUALS;
 			else if (atype == MONO_TYPE_R4) simd_intrins = INTERP_SIMD_INTRINSIC_V128_R4_EQUALS;
+			break;
+		case SN_EqualsAny:
+			simd_opcode = MINT_SIMD_INTRINS_P_PP;
+			if (atype == MONO_TYPE_I1 || atype == MONO_TYPE_U1) simd_intrins = INTERP_SIMD_INTRINSIC_V128_I1_EQUALS_ANY;
+			else if (atype == MONO_TYPE_I2 || atype == MONO_TYPE_U2) simd_intrins = INTERP_SIMD_INTRINSIC_V128_I2_EQUALS_ANY;
+			else if (atype == MONO_TYPE_I4 || atype == MONO_TYPE_U4) simd_intrins = INTERP_SIMD_INTRINSIC_V128_I4_EQUALS_ANY;
+			else if (atype == MONO_TYPE_I8 || atype == MONO_TYPE_U8) simd_intrins = INTERP_SIMD_INTRINSIC_V128_I8_EQUALS_ANY;
 			break;
 		case SN_ExtractMostSignificantBits:
 			simd_opcode = MINT_SIMD_INTRINS_P_P;

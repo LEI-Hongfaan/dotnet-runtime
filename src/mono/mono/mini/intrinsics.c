@@ -82,17 +82,13 @@ mini_emit_inst_for_ctor (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignat
 	if (!(cfg->opt & MONO_OPT_INTRINS))
 		return ins;
 
-#ifdef MONO_ARCH_SIMD_INTRINSICS
-	if (cfg->opt & MONO_OPT_SIMD) {
-		ins = mono_emit_simd_intrinsics (cfg, cmethod, fsig, args);
-		if (ins)
-			return ins;
-	}
+	ins = mono_emit_simd_intrinsics (cfg, cmethod, fsig, args);
+	if (ins)
+		return ins;
 
 	ins = mono_emit_common_intrinsics (cfg, cmethod, fsig, args);
 	if (ins)
 		return ins;
-#endif
 
 	return ins;
 }
@@ -287,7 +283,7 @@ llvm_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 		}
 	}
 
-	if (in_corlib && !strcmp (m_class_get_name (cmethod->klass), "Buffer")) {
+	if (in_corlib && !strcmp (m_class_get_name (cmethod->klass), "SpanHelpers")) {
 		if (!strcmp (cmethod->name, "Memmove") && fsig->param_count == 3 && m_type_is_byref (fsig->params [0]) && m_type_is_byref (fsig->params [1]) && !cmethod->is_inflated) {
 			MonoBasicBlock *end_bb;
 			NEW_BBLOCK (cfg, end_bb);
@@ -305,6 +301,41 @@ llvm_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			MONO_INST_NEW (cfg, ins, OP_MEMMOVE);
 			ins->sreg1 = args [0]->dreg; // i1* dst
 			ins->sreg2 = args [1]->dreg; // i1* src
+			ins->sreg3 = args [2]->dreg; // i32/i64 len
+			MONO_ADD_INS (cfg->cbb, ins);
+			MONO_START_BB (cfg, end_bb);
+		} else if (!strcmp (cmethod->name, "ClearWithoutReferences") && fsig->param_count == 2 && m_type_is_byref (fsig->params [0]) && !cmethod->is_inflated) {
+			MonoBasicBlock *end_bb;
+			NEW_BBLOCK (cfg, end_bb);
+
+			// do nothing if len == 0 (even if src is null)
+			MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, args [1]->dreg, 0);
+			MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBEQ, end_bb);
+
+			// throw NRE if src is null
+			MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, args [0]->dreg, 0);
+			MONO_EMIT_NEW_COND_EXC (cfg, EQ, "NullReferenceException");
+
+			MONO_INST_NEW (cfg, ins, OP_MEMSET_ZERO);
+			ins->sreg1 = args [0]->dreg; // i1* dst
+			ins->sreg2 = args [1]->dreg; // i32/i64 len
+			MONO_ADD_INS (cfg->cbb, ins);
+			MONO_START_BB (cfg, end_bb);
+		} else if (!strcmp (cmethod->name, "Fill") && fsig->param_count == 3 && m_type_is_byref (fsig->params [0]) && !cmethod->is_inflated) {
+			MonoBasicBlock *end_bb;
+			NEW_BBLOCK (cfg, end_bb);
+
+			// do nothing if len == 0 (even if src is null)
+			MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, args [1]->dreg, 0);
+			MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBEQ, end_bb);
+
+			// throw NRE if src is null
+			MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, args [0]->dreg, 0);
+			MONO_EMIT_NEW_COND_EXC (cfg, EQ, "NullReferenceException");
+
+			MONO_INST_NEW (cfg, ins, OP_MEMSET);
+			ins->sreg1 = args [0]->dreg; // i1* dst
+			ins->sreg2 = args [1]->dreg; // i8 value
 			ins->sreg3 = args [2]->dreg; // i32/i64 len
 			MONO_ADD_INS (cfg->cbb, ins);
 			MONO_START_BB (cfg, end_bb);
@@ -356,9 +387,10 @@ emit_span_intrinsics (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature
 		/* Similar to mini_emit_ldelema_1_ins () */
 		int size = mono_class_array_element_size (param_class);
 
-		int index_reg = mini_emit_sext_index_reg (cfg, args [1]);
+		gboolean need_sext;
+		int index_reg = mini_emit_sext_index_reg (cfg, args [1], &need_sext);
 
-		mini_emit_bounds_check_offset (cfg, span_reg, length_field->offset - MONO_ABI_SIZEOF (MonoObject), index_reg, NULL);
+		mini_emit_bounds_check_offset (cfg, span_reg, length_field->offset - MONO_ABI_SIZEOF (MonoObject), index_reg, NULL, need_sext);
 
 		// FIXME: Sign extend index ?
 
@@ -849,7 +881,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 #else
 			index_reg = args [1]->dreg;
 #endif
-			MONO_EMIT_BOUNDS_CHECK (cfg, args [0]->dreg, MonoString, length, index_reg);
+			MONO_EMIT_BOUNDS_CHECK (cfg, args [0]->dreg, MonoString, length, index_reg, FALSE);
 
 #if defined(TARGET_X86) || defined(TARGET_AMD64)
 			EMIT_NEW_X86_LEA (cfg, ins, args [0]->dreg, index_reg, 1, MONO_STRUCT_OFFSET (MonoString, chars));
@@ -906,7 +938,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			int sizes_reg = alloc_ireg (cfg);
 			MONO_EMIT_NEW_LOAD_MEMBASE_FAULT (cfg, vt_reg, args [0]->dreg, MONO_STRUCT_OFFSET (MonoObject, vtable));
 			EMIT_NEW_LOAD_MEMBASE (cfg, ins, OP_LOAD_MEMBASE, class_reg, vt_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
-			EMIT_NEW_LOAD_MEMBASE (cfg, ins, OP_LOADI4_MEMBASE, sizes_reg, class_reg, m_class_offsetof_sizes ());
+			EMIT_NEW_LOAD_MEMBASE (cfg, ins, OP_LOADI4_MEMBASE, sizes_reg, class_reg, GINTPTR_TO_TMREG (m_class_offsetof_sizes ()));
 			return ins;
 		}
 
@@ -934,10 +966,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 		} else
 			return NULL;
 	} else if (cmethod->klass == runtime_helpers_class) {
-		if (strcmp (cmethod->name, "get_OffsetToStringData") == 0 && fsig->param_count == 0) {
-			EMIT_NEW_ICONST (cfg, ins, MONO_STRUCT_OFFSET (MonoString, chars));
-			return ins;
-		} else if (!strcmp (cmethod->name, "GetRawData")) {
+		if (!strcmp (cmethod->name, "GetRawData")) {
 			int dreg = alloc_preg (cfg);
 			EMIT_NEW_BIALU_IMM (cfg, ins, OP_PADD_IMM, dreg, args [0]->dreg, MONO_ABI_SIZEOF (MonoObject));
 			return ins;
@@ -963,7 +992,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			else if (cfg->gshared && (t->type == MONO_TYPE_VAR || t->type == MONO_TYPE_MVAR) && !mini_type_var_is_vt (t))
 				EMIT_NEW_ICONST (cfg, ins, 1);
 			else if (!cfg->gshared || !mini_class_check_context_used (cfg, klass))
-				EMIT_NEW_ICONST (cfg, ins, m_class_has_references (klass) ? 1 : 0);
+				EMIT_NEW_ICONST (cfg, ins, m_class_has_references (klass) || m_class_has_ref_fields (klass) ? 1 : 0);
 			else {
 				g_assert (cfg->gshared);
 
@@ -1037,14 +1066,14 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			const int element_size = mono_type_size (t, &alignment);
 			const int num_elements = mono_type_size (field->type, &alignment) / element_size;
 			const int obj_size = MONO_ABI_SIZEOF (MonoObject);
-			
+
 			MonoInst* span = mono_compile_create_var (cfg, fsig->ret, OP_LOCAL);
 			MonoInst* span_addr;
 			EMIT_NEW_TEMPLOADA (cfg, span_addr, span->inst_c0);
 
 			MonoInst* ptr_inst;
 			if (cfg->compile_aot) {
-				NEW_RVACONST (cfg, ptr_inst, mono_class_get_image (mono_field_get_parent (field)), args [0]->inst_c0);
+				NEW_RVACONST (cfg, ptr_inst, mono_class_get_image (mono_field_get_parent (field)), GTMREG_TO_UINT32 (args [0]->inst_c0));
 				MONO_ADD_INS (cfg->cbb, ptr_inst);
 			} else {
 #if G_BYTE_ORDER == G_LITTLE_ENDIAN
@@ -1053,7 +1082,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 				const int swizzle = element_size;
 #endif
 				gpointer data_ptr = (gpointer)mono_field_get_rva (field, swizzle);
-				EMIT_NEW_PCONST (cfg, ptr_inst, data_ptr); 
+				EMIT_NEW_PCONST (cfg, ptr_inst, data_ptr);
 			}
 
 			MonoClassField* field_ref = mono_class_get_field_from_name_full (span->klass, "_reference", NULL);
@@ -2079,7 +2108,9 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			MonoType *t = method_context->method_inst->type_argv [0];
 			MonoClass *arg0 = mono_class_from_mono_type_internal (t);
 			if (m_class_is_valuetype (arg0) && !mono_class_has_default_constructor (arg0, FALSE)) {
-				if (m_class_is_primitive (arg0)) {
+				if (m_class_is_primitive (arg0) || m_class_is_enumtype (arg0)) {
+					if (m_class_is_enumtype (arg0))
+						t = mono_class_enum_basetype_internal (arg0);
 					int dreg = alloc_dreg (cfg, mini_type_to_stack_type (cfg, t));
 					mini_emit_init_rvar (cfg, dreg, t);
 					ins = cfg->cbb->last_ins;
@@ -2095,21 +2126,17 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 		}
 	}
 
-#ifdef MONO_ARCH_SIMD_INTRINSICS
-	if (cfg->opt & MONO_OPT_SIMD) {
-		ins = mono_emit_simd_intrinsics (cfg, cmethod, fsig, args);
-		if (ins)
-			return ins;
-	}
+	ins = mono_emit_simd_intrinsics (cfg, cmethod, fsig, args);
+	if (ins)
+		return ins;
 
 	ins = mono_emit_common_intrinsics (cfg, cmethod, fsig, args);
 	if (ins)
 		return ins;
-#endif
 
 	/* Fallback if SIMD is disabled */
-	if (in_corlib && 
-		((!strcmp ("System.Numerics", cmethod_klass_name_space) && !strcmp ("Vector", cmethod_klass_name)) || 
+	if (in_corlib &&
+		((!strcmp ("System.Numerics", cmethod_klass_name_space) && !strcmp ("Vector", cmethod_klass_name)) ||
 		!strncmp ("System.Runtime.Intrinsics", cmethod_klass_name_space, 25))) {
 		if (!strcmp (cmethod->name, "get_IsHardwareAccelerated")) {
 			EMIT_NEW_ICONST (cfg, ins, 0);
@@ -2119,7 +2146,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 	}
 
 	// On FullAOT, return false for RuntimeFeature:
-	// - IsDynamicCodeCompiled 
+	// - IsDynamicCodeCompiled
 	// - IsDynamicCodeSupported and no interpreter
 	// otherwise use the C# code in System.Private.CoreLib
 	if (in_corlib &&

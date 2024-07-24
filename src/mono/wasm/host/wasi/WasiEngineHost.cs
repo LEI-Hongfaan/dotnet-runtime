@@ -53,11 +53,16 @@ internal sealed class WasiEngineHost
         //                                        runtimeArguments: _args.CommonConfig.RuntimeArguments);
         // runArgsJson.Save(Path.Combine(_args.CommonConfig.AppPath, "runArgs.json"));
 
-        var args = new List<string>()
+        List<string> args = new() { "run" };
+
+        if (!_args.IsSingleFileBundle)
         {
-            "run",
-            "--dir",
-            "."
+            args.AddRange(["--dir", "."]);
+        };
+
+        if (_args.ForwardExitCode)
+        {
+            args.AddRange(["--env", "DOTNET_WASI_PRINT_EXIT_CODE=1"]);
         };
 
         args.AddRange(engineArgs);
@@ -85,11 +90,23 @@ internal sealed class WasiEngineHost
         foreach (string? arg in args)
             psi.ArgumentList.Add(arg!);
 
+        int? exitCodeOverride = null;
         int exitCode = await Utils.TryRunProcess(psi,
                                     _logger,
                                     msg => { if (msg != null) _logger.LogInformation(msg); },
-                                    msg => { if (msg != null) _logger.LogInformation(msg); });
+                                    msg => {
+                                        if (msg != null) {
+                                            if (_args.ForwardExitCode && msg.StartsWith("WASM EXIT "))
+                                            {
+                                                exitCodeOverride = int.Parse(msg.Substring(10));
+                                            }
+                                            else
+                                            {
+                                                _logger.LogInformation(msg);
+                                            }
+                                        }
+                                    });
 
-        return exitCode;
+        return exitCodeOverride ?? exitCode;
     }
 }
