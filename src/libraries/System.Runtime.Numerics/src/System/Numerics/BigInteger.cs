@@ -488,6 +488,20 @@ namespace System.Numerics
             AssertValid();
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private BigInteger(int n, uint[]? rgu, [ConstantExpected] bool noLengthCheck)
+        {
+            if (noLengthCheck && (rgu is not null) && (rgu.Length > MaxLength))
+            {
+                ThrowHelper.ThrowOverflowException();
+            }
+
+            _sign = n;
+            _bits = rgu;
+
+            AssertValid();
+        }
+
         /// <summary>
         /// Constructor used during bit manipulation and arithmetic.
         /// When possible the value will be packed into  _sign to conserve space.
@@ -1634,6 +1648,77 @@ namespace System.Numerics
             return Number.TryFormatBigInteger(this, format, NumberFormatInfo.GetInstance(provider), destination, out charsWritten);
         }
 
+        private static BigInteger OnesComplement(ReadOnlySpan<uint> bits, int sign)
+        {
+            bool trivial = bits.IsEmpty;
+
+            Debug.Assert(!trivial, "Trivial cases should be handled on the caller operator");
+
+            Debug.Assert(0 != sign, "Sign should not be zero on non-trivial cases");
+
+            if (sign >= 0)
+            {
+                // Positive x
+                // ~x = -x - 1 = -(x + 1) = -(abs(x) + 1)
+                int c = bits.IndexOfAnyExcept(uint.MaxValue);
+                // Since the abs value is increasing, the result must be packed into _bits.
+                if (/*Likely*/(0 <= c))
+                {
+                    Debug.Assert(c < bits.Length);
+                    int size = bits.Length;
+                    uint[] buffer = new uint[size];
+                    Span<uint> z = buffer;
+                    z[..c].Clear();
+                    z[c] = bits[c] + 1;
+                    Range g = (1 + c)..size;
+                    bits[g].CopyTo(z[g]);
+                    return new BigInteger(-1, buffer, noLengthCheck: true);
+                }
+                else
+                {
+                    // Array length won't overflow here in current design.
+                    // See comments on MaxLength.
+                    uint[] buffer = new uint[bits.Length + 1];
+                    buffer[bits.Length] = 1;
+                    return new BigInteger(-1, buffer, noLengthCheck: false);
+                }
+            }
+            else
+            {
+                // Negative x
+                // ~x = -x - 1 = abs(x) - 1
+                int c = bits.IndexOfAnyExcept(0u);
+                Debug.Assert(0 <= c && c < bits.Length);
+                bool mayBorrow = 1 + c == bits.Length;
+                bool borrow = false;
+                int size = bits.Length;
+                if (/*Unlikely*/(mayBorrow))
+                {
+                    uint v = bits[c];
+                    // Detect int.MinValue. See comments on s_bnMinInt.
+                    if (c == 0 && v == unchecked((uint)int.MinValue))
+                    {
+                        return new BigInteger(int.MaxValue, null, noLengthCheck: true);
+                    }
+                    if (v == 1)
+                    {
+                        borrow = true;
+                        --size;
+                    }
+                }
+                uint[] buffer = new uint[size];
+                Span<uint> z = buffer;
+                z[..c].Fill(uint.MaxValue);
+                if (!borrow)
+                {
+                    z[c] = bits[c] - 1;
+                    Range g = (1 + c)..size;
+                    bits[g].CopyTo(z[g]);
+                }
+                return new BigInteger(-1, buffer, noLengthCheck: true);
+            }
+        }
+
         private static BigInteger Add(ReadOnlySpan<uint> leftBits, int leftSign, ReadOnlySpan<uint> rightBits, int rightSign)
         {
             bool trivialLeft = leftBits.IsEmpty;
@@ -1694,7 +1779,7 @@ namespace System.Numerics
             }
 
             if (bitsFromPool != null)
-                    ArrayPool<uint>.Shared.Return(bitsFromPool);
+                ArrayPool<uint>.Shared.Return(bitsFromPool);
 
             return result;
         }
@@ -2629,7 +2714,7 @@ namespace System.Numerics
 
             if (zdFromPool != null)
                 ArrayPool<uint>.Shared.Return(zdFromPool);
-        exit:
+            exit:
             if (xdFromPool != null)
                 ArrayPool<uint>.Shared.Return(xdFromPool);
 
@@ -2638,7 +2723,9 @@ namespace System.Numerics
 
         public static BigInteger operator ~(BigInteger value)
         {
-            return -(value + One);
+            uint[]? bits = value._bits;
+            int sign = value._sign;
+            return bits is null ? new BigInteger(~sign) : OnesComplement(bits, sign);
         }
 
         public static BigInteger operator -(BigInteger value)
