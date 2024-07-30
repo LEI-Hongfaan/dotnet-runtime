@@ -1715,7 +1715,269 @@ namespace System.Numerics
                     Range g = (1 + c)..size;
                     bits[g].CopyTo(z[g]);
                 }
-                return new BigInteger(-1, buffer, noLengthCheck: true);
+                return new BigInteger(1, buffer, noLengthCheck: true);
+            }
+        }
+
+        private static Span<uint> AbsAsSpan(ref int a)
+        {
+            ref uint u = ref Unsafe.As<int, uint>(ref a);
+            u = NumericsHelpers.Abs(a);
+            return new Span<uint>(ref u);
+        }
+
+        [SkipLocalsInit]
+        private static BigInteger BitwiseAnd(ReadOnlySpan<uint> leftBits, int leftSign, ReadOnlySpan<uint> rightBits, int rightSign)
+        {
+            bool trivialLeft = leftBits.IsEmpty;
+            bool trivialRight = rightBits.IsEmpty;
+
+            Debug.Assert(!(trivialLeft && trivialRight), "Trivial cases should be handled on the caller operator");
+
+            int xSignedSize = trivialLeft ? Math.Sign(leftSign) : leftSign * leftBits.Length;
+            ReadOnlySpan<uint> xMagnitudeBits = trivialLeft ? AbsAsSpan(ref leftSign) : leftBits;
+            int ySingedSize = trivialRight ? Math.Sign(rightSign) : rightSign * rightBits.Length;
+            ReadOnlySpan<uint> yMagnitudeBits = trivialRight ? AbsAsSpan(ref rightSign) : rightBits;
+
+            if (xSignedSize < ySingedSize)
+            {
+                (xSignedSize, ySingedSize) = (ySingedSize, xSignedSize);
+                var t = xMagnitudeBits;
+                xMagnitudeBits = yMagnitudeBits;
+                yMagnitudeBits = t;
+            }
+
+            if (ySingedSize >= 0)
+            {
+                Debug.Assert(xSignedSize == 0 && 1 == xMagnitudeBits.Length || xSignedSize == xMagnitudeBits.Length);
+                Debug.Assert(ySingedSize == 0 && 1 == yMagnitudeBits.Length || ySingedSize == yMagnitudeBits.Length);
+
+                for (int i = ySingedSize; 0 <= --i;)
+                {
+                    uint v;
+                    if ((v = xMagnitudeBits[i] & yMagnitudeBits[i]) != 0)
+                    {
+                        int size = i + 1;
+                        if (!(size <= 1 && v <= (uint)int.MaxValue))
+                        {
+                            uint[] resultBuffer = GC.AllocateUninitializedArray<uint>(size);
+                            Span<uint> z = resultBuffer;
+                            Range g = ..size;
+                            NumericsHelpers.BitwiseAnd(xMagnitudeBits[g], yMagnitudeBits[g], z/*[g]*/);
+                            return new BigInteger(1, resultBuffer, noLengthCheck: true);
+                        }
+                        return new BigInteger((int)v, null, noLengthCheck: true);
+                    }
+                }
+                return Zero;
+            }
+            else
+            {
+                ySingedSize = -ySingedSize;
+                Debug.Assert(ySingedSize == yMagnitudeBits.Length, $@"{ySingedSize}, {yMagnitudeBits.Length}");
+                if (xSignedSize < 0)
+                {
+                    /*
+                    Assuming both x, y are negative,
+                    x & y = ~(~x | ~y) = -((-(x + 1) | -(y + 1)) + 1) = -(((-x - 1) | (-y - 1)) + 1)
+                    abs(x & y) = ((abs(x) - 1) | (abs(y) - 1)) + 1
+                    */
+                    xSignedSize = -xSignedSize;
+                    Debug.Assert(xSignedSize == xMagnitudeBits.Length);
+                    Debug.Assert(xSignedSize <= ySingedSize);
+
+                    int m = xMagnitudeBits.IndexOfAnyExcept(0u);
+                    Debug.Assert(0 <= m && m < xMagnitudeBits.Length);
+                    uint u = unchecked(xMagnitudeBits[m] - 1);
+
+                    int n = yMagnitudeBits.IndexOfAnyExcept(0u);
+                    Debug.Assert(0 <= n && n < yMagnitudeBits.Length);
+                    uint v = unchecked(yMagnitudeBits[n] - 1);
+
+                    int size = yMagnitudeBits.Length;
+                    int j = xMagnitudeBits.Length;
+                    uint[]? resultBufferFromPool = null;
+                    Span<uint> z = (size <= BigIntegerCalculator.StackAllocThreshold ?
+                        stackalloc uint[BigIntegerCalculator.StackAllocThreshold] :
+                        resultBufferFromPool = ArrayPool<uint>.Shared.Rent(size))[..size];
+                    bool w = m > n;
+                    int k = w ? m : n;
+                    // These bits are 1111 after (x - 1)
+                    // but we will add +1 back later, so they are finally 0000.
+                    z[..k].Clear();
+                    z[k] = m == n ? u | v : (w ? u | (/*Unlikely*/(yMagnitudeBits.Length <= k) ? 0 : yMagnitudeBits[k]) : v | (/*Unlikely*/(xMagnitudeBits.Length <= k) ? 0 : xMagnitudeBits[k]));
+                    int l = 1 + k;
+                    if (l < j)
+                    {
+                        Range g = l..j;
+                        l = j;
+                        NumericsHelpers.BitwiseOr(xMagnitudeBits[g], yMagnitudeBits[g], z[g]);
+                    }
+                    if (l < size)
+                    {
+                        Range g = l..size;
+                        yMagnitudeBits[g].CopyTo(z[g]);
+                    }
+
+                    int c = IncreaseInternal(z[k..]);
+                    size = 1 + (/*Unlikely*/(c != 0) ? size : z.LastIndexOfAnyExcept(0u));
+
+                    BigInteger result;
+                    if (size == 0 || size == 1 && z[0] <= (uint)int.MaxValue)
+                    {
+                        result = new BigInteger(size == 0 ? 0 : -(int)z[0], null, noLengthCheck: true);
+                    }
+                    else
+                    {
+                        uint[] buffer = /*Unlikely*/(c != 0) ? Extend1(z) : z[..size].ToArray();
+                        result = new BigInteger(-1, buffer, noLengthCheck: false);
+                    }
+                    if (resultBufferFromPool != null)
+                    {
+                        ArrayPool<uint>.Shared.Return(resultBufferFromPool);
+                    }
+                    return result;
+
+                    static int IncreaseInternal(Span<uint> bits)
+                    {
+                        for (int i = 0; bits.Length > i; ++i)
+                        {
+                            if (/*Likely*/(bits[i]++ != uint.MaxValue))
+                            {
+                                return 0;
+                            }
+                        }
+                        return 1;
+                    }
+
+                    static uint[] Extend1(Span<uint> bits)
+                    {
+                        uint[] buffer = GC.AllocateUninitializedArray<uint>(1 + bits.Length);
+                        bits.CopyTo(buffer);
+                        buffer[bits.Length] = 1;
+                        return buffer;
+                    }
+                }
+                else
+                {
+                    Debug.Assert(xSignedSize == 0 && 1 == xMagnitudeBits.Length || xSignedSize == xMagnitudeBits.Length);
+                    // x & y = x & -abs(y) = x & ~(abs(y) - 1)
+                    // abs(x & y) = abs(x) & ~(abs(y) - 1)
+                    // Note: abs(y) and -abs(y) have the same trailing zeros
+                    // z[..n] = 0000
+                    int n = yMagnitudeBits.IndexOfAnyExcept(0u);
+                    Debug.Assert(0 <= n && n < yMagnitudeBits.Length);
+
+                    if (xSignedSize <= ySingedSize)
+                    {
+                        // 0 ???? xxxx .... & ~ 1 yyyy yyyy .... = 0 ???? ???? ....
+                        // Leading leftBits may be zero. Try find the normalized size.
+                        int size = 1 + FindLastIndexOfAnyBitwiseAndNotResultExceptZero(xMagnitudeBits, yMagnitudeBits, 1 + n, xSignedSize);
+                        Debug.Assert((size == xSignedSize && n >= xSignedSize) || (n < size && size <= xSignedSize));
+
+                        if (/*Unlikely*/(!(1 + n < size)))
+                        {
+                            /*
+                             * This can happen!
+                             * n >= size - 1
+                             *
+                             * When last leftBits are something other than x & ~abs(y), find the real size.
+                             * size = 1 + z.IndexOfAnyExcept(0u); // size = 0 when z == 0
+                             */
+                            if (n < size)
+                            {
+                                Debug.Assert(n == size - 1);
+                                // size = 1 + n;
+                                uint v;
+                                if (/*Unlikely*/((v = xMagnitudeBits[n] & (uint)-(int)yMagnitudeBits[n]) == 0))
+                                {
+                                    return Zero;
+                                }
+                                if (size == 1 && v <= (uint)int.MaxValue)
+                                {
+                                    return new BigInteger((int)v, null, noLengthCheck: true);
+                                }
+                                uint[] buffer = ShiftLeft1(v, n);
+                                return new BigInteger(1, buffer, noLengthCheck: false);
+
+                                static uint[] ShiftLeft1(uint value, int shiftCount)
+                                {
+                                    uint[] a = new uint[1 + shiftCount];
+                                    a[shiftCount] = value;
+                                    return a;
+                                }
+                            }
+                            else
+                            {
+                                // size = 0;
+                                return Zero;
+                            }
+                        }
+                        uint[]? resultBufferFromPool = null;
+                        Span<uint> z = (size <= BigIntegerCalculator.StackAllocThreshold ?
+                            stackalloc uint[BigIntegerCalculator.StackAllocThreshold] :
+                            resultBufferFromPool = ArrayPool<uint>.Shared.Rent(size))[..size];
+                        {
+                            z[..n].Clear();
+                            z[n] = xMagnitudeBits[n] & (uint)-(int)yMagnitudeBits[n];
+                            // abs(y) and abs(y) - 1 have the same upper leftBits (index above n)
+                            // So, x & y = x & ~(abs(y) - 1) = x & ~abs(y)
+                            Range g = (1 + n)..size;
+                            NumericsHelpers.AndNot(xMagnitudeBits[g], yMagnitudeBits[g], z[g]);
+                        }
+                        BigInteger result;
+                        Debug.Assert(size > 0);
+                        // Make sure we have handled all size == 0 cases at this point, or add `size == 0 || `...
+                        result = size == 1 && z[0] <= (uint)int.MaxValue
+                            ? new BigInteger(size == 0 ? 0 : (int)z[0], null, noLengthCheck: true)
+                            : new BigInteger(1, z[..size].ToArray(), noLengthCheck: true);
+                        if (resultBufferFromPool != null)
+                        {
+                            ArrayPool<uint>.Shared.Return(resultBufferFromPool);
+                        }
+                        return result;
+
+                        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                        static int FindLastIndexOfAnyBitwiseAndNotResultExceptZero(ReadOnlySpan<uint> x, ReadOnlySpan<uint> y, int start, int end)
+                        {
+                            int i = end;
+                            for (; start <= --i;)
+                            {
+                                if ((x[i] & ~y[i]) != 0)
+                                {
+                                    break;
+                                }
+                            }
+                            return i;
+                        }
+                    }
+                    else
+                    {
+                        // 0 xxxx xxxx .... & 1 1111 YYYY .... = 0 xxxx ???? ....
+                        // size(result) == size(x) since leading xxxx can not be zero.
+                        int size = xSignedSize;
+                        uint v = xMagnitudeBits[0] & (uint)-(int)yMagnitudeBits[0];
+                        if (!(size <= 1 && v <= (uint)int.MaxValue))
+                        {
+                            uint[] buffer = GC.AllocateUninitializedArray<uint>(size);
+                            Span<uint> z = buffer;
+                            z[..n].Clear();
+                            z[n] = xMagnitudeBits[n] & (uint)-(int)yMagnitudeBits[n];
+                            if (1 + n < yMagnitudeBits.Length)
+                            {
+                                Range g = (1 + n)..yMagnitudeBits.Length;
+                                NumericsHelpers.AndNot(xMagnitudeBits[g], yMagnitudeBits[g], z[g]);
+                            }
+                            Debug.Assert(1 + n <= yMagnitudeBits.Length);
+                            {
+                                Range g = yMagnitudeBits.Length..size;
+                                xMagnitudeBits[g].CopyTo(z[g]);
+                            }
+                            return new BigInteger(1, buffer, noLengthCheck: true);
+                        }
+                        return new BigInteger((int)v, null, noLengthCheck: true);
+                    }
+                }
             }
         }
 
@@ -2408,58 +2670,18 @@ namespace System.Numerics
 
         public static BigInteger operator &(BigInteger left, BigInteger right)
         {
-            if (left.IsZero || right.IsZero)
-            {
-                return Zero;
-            }
+            uint[]? p = left._bits;
+            uint[]? q = right._bits;
 
-            if (left._bits is null && right._bits is null)
-            {
-                return left._sign & right._sign;
-            }
-
-            uint xExtend = (left._sign < 0) ? uint.MaxValue : 0;
-            uint yExtend = (right._sign < 0) ? uint.MaxValue : 0;
-
-            uint[]? leftBufferFromPool = null;
-            int size = (left._bits?.Length ?? 1) + 1;
-            Span<uint> x = ((uint)size <= BigIntegerCalculator.StackAllocThreshold
-                         ? stackalloc uint[BigIntegerCalculator.StackAllocThreshold]
-                         : leftBufferFromPool = ArrayPool<uint>.Shared.Rent(size)).Slice(0, size);
-            x = x.Slice(0, left.WriteTo(x));
-
-            uint[]? rightBufferFromPool = null;
-            size = (right._bits?.Length ?? 1) + 1;
-            Span<uint> y = ((uint)size <= BigIntegerCalculator.StackAllocThreshold
-                         ? stackalloc uint[BigIntegerCalculator.StackAllocThreshold]
-                         : rightBufferFromPool = ArrayPool<uint>.Shared.Rent(size)).Slice(0, size);
-            y = y.Slice(0, right.WriteTo(y));
-
-            uint[]? resultBufferFromPool = null;
-            size = Math.Max(x.Length, y.Length);
-            Span<uint> z = (size <= BigIntegerCalculator.StackAllocThreshold
-                         ? stackalloc uint[BigIntegerCalculator.StackAllocThreshold]
-                         : resultBufferFromPool = ArrayPool<uint>.Shared.Rent(size)).Slice(0, size);
-
-            for (int i = 0; i < z.Length; i++)
-            {
-                uint xu = ((uint)i < (uint)x.Length) ? x[i] : xExtend;
-                uint yu = ((uint)i < (uint)y.Length) ? y[i] : yExtend;
-                z[i] = xu & yu;
-            }
-
-            if (leftBufferFromPool != null)
-                ArrayPool<uint>.Shared.Return(leftBufferFromPool);
-
-            if (rightBufferFromPool != null)
-                ArrayPool<uint>.Shared.Return(rightBufferFromPool);
-
-            var result = new BigInteger(z);
-
-            if (resultBufferFromPool != null)
-                ArrayPool<uint>.Shared.Return(resultBufferFromPool);
-
-            return result;
+            int s = left._sign;
+            int t = right._sign;
+            /*
+             * BitwiseAnd correctly handles zero operands, and has complexity
+             * O(min(length(x), length(y))) when the result is non-negative.
+             * So we delegate these cases to BitwiseAnd instead of handling them here.
+             */
+            // (s & t) can be int.MinValue.
+            return p is null && q is null ? new BigInteger(s & t) : BitwiseAnd(p, s, q, t);
         }
 
         public static BigInteger operator |(BigInteger left, BigInteger right)
